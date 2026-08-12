@@ -29,3 +29,5 @@ class RAGPipeline():
 
 if __name__=="__main__":
     fire.Fire(RAGPipeline)
+
+# NE PAS OUBLIER KEYBOARDINTERRUPTED

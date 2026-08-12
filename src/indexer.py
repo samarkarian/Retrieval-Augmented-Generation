@@ -176,8 +176,3 @@ class CodeIndexer:
 
         return chunks_tokenizer
 
-
-if __name__ == '__main__':
-
-    indexer = CodeIndexer()
-    indexer.index_corpus(2000)
