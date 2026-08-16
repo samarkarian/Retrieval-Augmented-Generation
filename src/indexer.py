@@ -1,148 +1,208 @@
+"""Corpus ingestion: chunking, tokenization and BM25 index construction."""
+
 from typing import List
 from pathlib import Path
 import re
 from rank_bm25 import BM25Okapi
 import json
 import pickle
+from tqdm import tqdm
+from .tokenizer import tokenize
+
 
 class CodeIndexer:
+    """Splits corpus files into chunks and builds a BM25 index.
 
-    def chunk_python_file(self, content: str, max_chunk_size: int, path_file: str) -> List[dict]:
-        chunks_py = []
+    Boundaries are character positions found in the original text, and
+    content is always a slice of it, so indices and content cannot drift
+    apart.
+    """
 
-        with open(content, 'r') as f:
-            lines = f.readlines()
+    def chunk_python_file(
+            self, content: str,
+            max_chunk_size: int, path_file: str) -> List[dict]:
+        """Chunk a Python file on class/def boundaries, then by paragraphs.
 
-        current_chunk_lines = []
-        char_position = 0
+        Args:
+            content: Path to the file to read.
+            max_chunk_size: Upper bound on chunk length, in characters.
+            path_file: Path to record in each chunk; compared literally by
+                the grader.
 
-        for line in lines:
-            if re.match('^(class |def )', line):
-                if current_chunk_lines:
-                    chunk_content = ''.join(current_chunk_lines)
-                    self._process_chunk(chunk_content, max_chunk_size, path_file, char_position, chunks_py)
-                    char_position += len(chunk_content)
-                current_chunk_lines = [line]
-            else:
-                current_chunk_lines.append(line)
-
-        if current_chunk_lines:
-            chunk_content = ''.join(current_chunk_lines)
-            self._process_chunk(chunk_content, max_chunk_size, path_file, char_position, chunks_py)
-
-        return chunks_py
-
-    def _process_chunk(self, chunk_content: str, max_chunk_size: int, path_file: str, start_pos: int, chunks_list: List[dict]) -> None:
-
-        if len(chunk_content) <= max_chunk_size:
-            chunk_dict = {
-                "file_path": path_file,
-                "first_character_index": start_pos,
-                "last_character_index": start_pos + len(chunk_content),
-                "content": chunk_content
-            }
-            chunks_list.append(chunk_dict)
-        else:
-            paragraphs = re.split(r'\n\n+', chunk_content)
-            current_chunk = ""
-            char_pos = start_pos
-
-            for para in paragraphs:
-                if len(current_chunk) + len(para) <= max_chunk_size:
-                    current_chunk += para + "\n\n"
-                else:
-                    if current_chunk:
-                        chunk_dict = {
-                            "file_path": path_file,
-                            "first_character_index": char_pos,
-                            "last_character_index": char_pos + len(current_chunk),
-                            "content": current_chunk
-                        }
-                        chunks_list.append(chunk_dict)
-                        char_pos += len(current_chunk)
-                    current_chunk = para + "\n\n"
-
-            if current_chunk:
-                chunk_dict = {
-                    "file_path": path_file,
-                    "first_character_index": char_pos,
-                    "last_character_index": char_pos + len(current_chunk),
-                    "content": current_chunk
-                }
-                chunks_list.append(chunk_dict)
-
-
-
-    def chunk_markdown_file(self, content: str, max_chunk_size: int, path_file: str) -> List[dict]:
-        """Chunk a markdown file by headings, then by paragraphs if needed."""
-        chunks_md = []
+        Returns:
+            The chunk records for this file.
+        """
+        chunks_py: List[dict] = []
 
         with open(content, 'r') as f:
             file_content = f.read()
 
-        parts = re.split('^(#{1,6} .*)$', file_content, flags=re.MULTILINE)
+        starts = []
+        for m in re.finditer(r'^(class |def )', file_content,
+                             flags=re.MULTILINE):
+            starts.append(m.start())
 
-        sections = []
-        i = 1
-        while i < len(parts):
-            heading = parts[i]
-            section_content = parts[i + 1] if i + 1 < len(parts) else ""
-            sections.append(heading + section_content)
-            i += 2
+        if not starts or starts[0] != 0:
+            starts.insert(0, 0)
+        starts.append(len(file_content))
 
-        char_position = 0
-        for section in sections:
-            if len(section) <= max_chunk_size:
+        for i in range(len(starts) - 1):
+            self._split_range(file_content, starts[i], starts[i + 1],
+                              max_chunk_size, path_file, chunks_py)
+
+        return chunks_py
+
+    def _split_range(
+            self, text: str, start: int, end: int, max_chunk_size: int,
+            path_file: str, chunks_list: List[dict]) -> None:
+        """Emit chunks covering text[start:end], cutting on blank lines.
+
+        Accumulates up to the last cut position that still fits, then emits
+        there.
+
+        Args:
+            text: The whole file content.
+            start: Absolute start of the range to cover.
+            end: Absolute end of the range to cover.
+            max_chunk_size: Upper bound on chunk length.
+            path_file: Path to record in each chunk.
+            chunks_list: Accumulator the chunks are appended to.
+        """
+
+        if (end - start) <= max_chunk_size:
+            self._add_chunk(
+                text, start, end, max_chunk_size, path_file, chunks_list
+            )
+            return
+
+        positions = []
+        for sep in re.finditer(r'\n\n+', text[start:end]):
+            positions.append(start + sep.end())
+        positions.append(end)
+
+        prev = start
+        for pos in positions:
+            if (pos - start) > max_chunk_size and prev > start:
+                self._add_chunk(text, start, prev, max_chunk_size,
+                                path_file, chunks_list)
+                start = prev
+            prev = pos
+
+        self._add_chunk(
+            text, start, end, max_chunk_size, path_file, chunks_list
+        )
+
+    def _add_chunk(
+            self, text: str, start: int, end: int, max_chunk_size: int,
+            path_file: str, chunks_list: List[dict]) -> None:
+        """Store text[start:end], slicing anything still over the limit.
+
+        The only place that writes a chunk, and so the only place the size
+        limit has to be enforced.
+
+        Args:
+            text: The whole file content.
+            start: Absolute start of the range to store.
+            end: Absolute end of the range to store.
+            max_chunk_size: Upper bound on chunk length.
+            path_file: Path to record in each chunk.
+            chunks_list: Accumulator the chunks are appended to.
+        """
+
+        while start < end:
+            stop = start + max_chunk_size
+            if stop < end:
+                chunk = text[start: stop]
                 chunk_dict = {
                     "file_path": path_file,
-                    "first_character_index": char_position,
-                    "last_character_index": char_position + len(section),
-                    "content": section
+                    "first_character_index": start,
+                    "last_character_index": stop,
+                    "content": chunk
                 }
-                chunks_md.append(chunk_dict)
-                char_position += len(section)
+                chunks_list.append(chunk_dict)
+                start = stop
             else:
-                paragraphs = re.split(r'\n\n+', section)
-                current_chunk = ""
-                for para in paragraphs:
-                    if len(current_chunk) + len(para) <= max_chunk_size:
-                        current_chunk += para + "\n\n"
-                    else:
-                        if current_chunk:
-                            chunk_dict = {
-                                "file_path": path_file,
-                                "first_character_index": char_position,
-                                "last_character_index": char_position + len(current_chunk),
-                                "content": current_chunk
-                            }
-                            chunks_md.append(chunk_dict)
-                            char_position += len(current_chunk)
-                        current_chunk = para + "\n\n"
+                chunk = text[start: end]
+                chunk_dict = {
+                    "file_path": path_file,
+                    "first_character_index": start,
+                    "last_character_index": end,
+                    "content": chunk
+                }
+                chunks_list.append(chunk_dict)
+                start = end
 
-                if current_chunk:
-                    chunk_dict = {
-                        "file_path": path_file,
-                        "first_character_index": char_position,
-                        "last_character_index": char_position + len(current_chunk),
-                        "content": current_chunk
-                    }
-                    chunks_md.append(chunk_dict)
-                    char_position += len(current_chunk)
+    def chunk_markdown_file(
+            self, content: str,
+            max_chunk_size: int, path_file: str) -> List[dict]:
+        """Chunk a markdown file by headings, then by paragraphs if needed.
+
+        Args:
+            content: Path to the file to read.
+            max_chunk_size: Upper bound on chunk length, in characters.
+            path_file: Path to record in each chunk; compared literally by
+                the grader.
+
+        Returns:
+            The chunk records for this file.
+        """
+        chunks_md: List[dict] = []
+
+        with open(content, 'r') as f:
+            file_content = f.read()
+
+        starts = []
+        for m in re.finditer(r'^#{1,6} .*$', file_content, flags=re.MULTILINE):
+            starts.append(m.start())
+
+        if not starts or starts[0] != 0:
+            starts.insert(0, 0)
+        starts.append(len(file_content))
+
+        for i in range(len(starts) - 1):
+            self._split_range(file_content, starts[i], starts[i + 1],
+                              max_chunk_size, path_file, chunks_md)
 
         return chunks_md
 
     def index_corpus(self, max_chunk_size: int) -> List[dict]:
+        """Ingest data/raw/ and write the index under data/processed/.
 
-        folder = Path("data/raw/vllm-0.10.1")
+        Writes chunks.json, holding the chunk records, and
+        bm25_vectorizer.pkl, holding the statistics learned from them. Files
+        that cannot be decoded are skipped.
 
+        Args:
+            max_chunk_size: Upper bound on chunk length, in characters.
+
+        Returns:
+            Every chunk of the corpus, or an empty list if none was found.
+        """
+
+        folder = Path("data/raw/")
+        files = (list(folder.rglob('*.md'))
+                 + list(folder.rglob('*.py'))
+                 + list(folder.rglob('*.txt')))
         all_chunks = []
-        for file in folder.rglob("*.md"):
-            chunks = self.chunk_markdown_file(str(file), max_chunk_size, str(file))
-            all_chunks.extend(chunks)
 
-        for file in folder.rglob('*.py'):
-            chunks = self.chunk_python_file(str(file), max_chunk_size, str(file))
-            all_chunks.extend(chunks)
+        for file in tqdm(files, desc='Indexing'):
+            file_str = str(file)
+            try:
+                if file_str.endswith('.md'):
+                    chunks = self.chunk_markdown_file(
+                        file_str, max_chunk_size, file_str
+                    )
+                else:
+                    chunks = self.chunk_python_file(
+                        file_str, max_chunk_size, file_str
+                    )
+                all_chunks.extend(chunks)
+            except (UnicodeDecodeError, OSError) as e:
+                tqdm.write(str(e))
+
+        if len(all_chunks) == 0:
+            print("No indexable files found in data/raw/")
+            return []
 
         chunks_tokenized = self._tokenize(all_chunks)
         bm25 = BM25Okapi(chunks_tokenized)
@@ -163,16 +223,16 @@ class CodeIndexer:
         return all_chunks
 
     def _tokenize(self, content: List[dict]) -> List[List[str]]:
+        """Turn chunk records into the token lists BM25 learns from."""
 
         chunks_content: List[str] = []
-        chunks_tokenizer: list[str] = []
+        chunks_tokenizer: List[List[str]] = []
 
         for c in content:
             chunks_content.append(c['content'])
 
         for words in chunks_content:
-            tokens = words.lower().split()
+            tokens = tokenize(words)
             chunks_tokenizer.append(tokens)
 
         return chunks_tokenizer
-

@@ -1,25 +1,36 @@
+"""Lexical retrieval over the BM25 index built by the indexer."""
+
 from typing import List
 import pickle
 import json
-from rank_bm25 import BM25Okapi
+from .tokenizer import tokenize
+
 
 class Retriever:
+    """Ranks corpus chunks against a question using BM25."""
 
-    def __init__(self, index_path: str, chunks_path: str) -> None:
-        """Load BM25 index and chunks from disk."""
+    def __init__(self, bm25_path: str, chunks_path: str) -> None:
+        """Load the BM25 index and the chunk records from disk."""
 
-        with open(index_path, 'rb') as f:
+        with open(bm25_path, 'rb') as f:
             self.bm25 = pickle.load(f)
 
         with open(chunks_path, 'r') as f:
             self.chunks = json.load(f)
 
-
     def retrieve(self, query: str, k: int = 5) -> List[dict]:
-        """Retrieve top-k chunks for a query."""
+        """Retrieve the top-k chunk records for a query, ranked by score.
 
-        tokenize_query = query.lower().split()
-        result = self.bm25.get_top_n(tokenize_query, self.chunks, k)
+        Args:
+            query: The question, in plain text.
+            k: How many chunks to return.
+
+        Returns:
+            The k highest-scoring chunk records.
+        """
+
+        tokenize_query = tokenize(query)
+        result: List[dict] = self.bm25.get_top_n(
+            tokenize_query, self.chunks, k)
 
         return result
-
