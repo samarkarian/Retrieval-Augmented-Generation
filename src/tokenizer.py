@@ -1,5 +1,3 @@
-"""The single tokenizer used by both indexing and querying."""
-
 from typing import List
 import re
 

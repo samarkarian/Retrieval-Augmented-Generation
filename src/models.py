@@ -1,5 +1,3 @@
-"""Pydantic models exchanged between the stages of the pipeline."""
-
 from pydantic import BaseModel, Field
 from typing import List
 import uuid

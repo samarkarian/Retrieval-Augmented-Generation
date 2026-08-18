@@ -1,5 +1,3 @@
-"""Lexical retrieval over the BM25 index built by the indexer."""
-
 from typing import List
 import pickle
 import json

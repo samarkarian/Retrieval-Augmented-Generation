@@ -1,5 +1,3 @@
-"""Answer generation from retrieved chunks, using a local causal LM."""
-
 from typing import Any, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 

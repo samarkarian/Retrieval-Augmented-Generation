@@ -1,12 +1,8 @@
-"""Command line entry point, exposed with Python Fire.
-
-Run as `uv run python -m src <command>`.
-"""
-
 import fire
 from .models import (
         MinimalSearchResults, MinimalAnswer, MinimalSource,
-        RagDataset, StudentSearchResults, StudentSearchResultsAndAnswer
+        RagDataset, StudentSearchResults, StudentSearchResultsAndAnswer,
+        AnsweredQuestion
     )
 from .indexer import CodeIndexer
 from .retriever import Retriever
@@ -222,7 +218,7 @@ class RAGPipeline():
         directory.mkdir(parents=True, exist_ok=True)
         output_path = directory / Path(student_search_results_path).name
 
-        with output_path.open('w') as f:
+        with open(output_path, 'w') as f:
             f.write(out.model_dump_json(indent=2))
 
         print(
@@ -242,7 +238,85 @@ class RAGPipeline():
             student_search_results_path: Path to a StudentSearchResults file.
             dataset_path: Path to the matching AnsweredQuestions dataset.
         """
-        pass
+
+        with open(dataset_path, 'r') as f:
+            dataset = RagDataset.model_validate(json.load(f))
+
+        with open(student_search_results_path, 'r') as f:
+            student = StudentSearchResults.model_validate(json.load(f))
+
+        results_by_id: dict[str, MinimalSearchResults] = {}
+        for r in student.search_results:
+            results_by_id[r.question_id] = r
+
+        k_values: list[int] = []
+        for k in (1, 3, 5, 10):
+            if k <= student.k:
+                k_values.append(k)
+        if student.k not in k_values:
+            k_values.append(student.k)
+        k_values = sorted(set(k_values))
+
+        recall_sums: dict[int, float] = {}
+        for k in k_values:
+            recall_sums[k] = 0.0
+        evaluated = 0
+
+        for question in dataset.rag_questions:
+            if not isinstance(question, AnsweredQuestion) \
+                    or not question.sources:
+                continue
+            evaluated += 1
+
+            result = results_by_id.get(question.question_id)
+            if result is None:
+                print(f'{question.question_id} not found in '
+                      f'{student_search_results_path}')
+            retrieved = result.retrieved_sources if result else []
+
+            for k in k_values:
+                top_k = retrieved[:k]
+                found = 0
+                for source in question.sources:
+                    for res in top_k:
+                        if source.file_path != res.file_path:
+                            continue
+                        iou = self._calculate_iou(
+                            source.first_character_index,
+                            source.last_character_index,
+                            res.first_character_index,
+                            res.last_character_index,
+                        )
+                        if iou >= 0.05:
+                            found += 1
+                            break
+                recall_sums[k] += found / len(question.sources)
+
+        if evaluated == 0:
+            print('No answered questions to evaluate.')
+            return
+
+        parts: list[str] = []
+        for k in k_values:
+            parts.append(f'Recall@{k}: {recall_sums[k] / evaluated:.3f}')
+        print(' '.join(parts))
+
+    @staticmethod
+    def _calculate_iou(
+            a_start: int, a_end: int, b_start: int, b_end: int) -> float:
+        """Intersection-over-union of two character ranges.
+
+        Returns 0.0 when the ranges do not overlap, so a single comparison
+        against the 0.05 bar decides whether a source counts as found.
+        """
+
+        intersection = max(0, min(a_end, b_end) - max(a_start, b_start))
+        if intersection == 0:
+            return 0.0
+        union = (a_end - a_start) + (b_end - b_start) - intersection
+        if union <= 0:
+            return 0.0
+        return intersection / union
 
 
 if __name__ == "__main__":

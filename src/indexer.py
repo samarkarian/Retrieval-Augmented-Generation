@@ -1,5 +1,3 @@
-"""Corpus ingestion: chunking, tokenization and BM25 index construction."""
-
 from typing import List
 from pathlib import Path
 import re
