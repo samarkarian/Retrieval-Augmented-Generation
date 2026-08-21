@@ -83,23 +83,26 @@ tokens that no longer resemble each other, and recall would collapse silently.
 
 ## Chunking Strategy
 
-Two strategies, one per file kind, converging on the same machinery.
+Two strategies, one per file kind, both built on LangChain's
+`RecursiveCharacterTextSplitter`. It splits on a hierarchy of separators and
+falls back to blank lines, spaces, and finally single characters, so no chunk
+exceeds `--max_chunk_size`.
 
-- **Python** — cut on top-level `class` and `def`, so a chunk holds a complete
-  definition.
-- **Markdown and text** — cut on headings, so a chunk holds a section.
+- **Python** — `Language.PYTHON`, cutting on `class` and `def` first, so a
+  chunk holds a complete definition.
+- **Markdown and text** — `Language.MARKDOWN`, cutting on headings first, so a
+  chunk holds a section.
 
-A section over `--max_chunk_size` is re-cut on blank lines, and sliced at a
-fixed width as a last resort. That fallback matters: the grader rejects any
+Chunks carry a 200-character overlap, so a passage sitting on a boundary lands
+whole in at least one chunk. The size cap matters: the grader rejects any
 source longer than 2000 characters, and one oversized source invalidates the
-whole submission. Every chunk passes through `_add_chunk`, the only place that
-enforces the limit.
+whole submission; the character-level fallback guarantees the limit.
 
-**Positions, not lengths.** The chunker never rebuilds text. Boundaries come
-from `re.finditer()`, content from slicing the original string. Because the
-content is derived from the indices, the two cannot contradict each other —
-all 18 792 chunks verify `source_file[first:last] == content` exactly. This was
-learned the hard way (see *Challenges*).
+**Exact offsets.** Each chunk records the character range it was sliced from,
+via `add_start_index=True`, and `strip_whitespace=False` keeps the content an
+exact slice of the source — so all 14 692 chunks verify
+`source_file[first:last] == content` exactly. That invariant is what the grader
+compares against (see *Challenges*).
 
 ## Retrieval Method
 
@@ -123,18 +126,24 @@ punctuation and emits a compound identifier **whole and in parts**:
 A question quoting `fused_batched_moe` matches the whole token; one asking
 about "the fused batched MoE layer" matches the parts.
 
+**File name in the index.** Each chunk is tokenised with its file name
+prepended, so a query term that names the file — `lora` for `lora.md`, `openai`
+for `openai_chat_completion.py` — lifts that chunk in the ranking. Only the
+name is used: the directory components added noise and cost recall (measured).
+The stored content is untouched, so character indices stay exact.
+
 ## Performance Analysis
 
 Measured on the public datasets (100 questions each), CPU only.
 
 | | @1 | @3 | **@5** | @10 | required @5 |
 |---|---|---|---|---|---|
-| **docs** | 0.610 | 0.750 | **0.820** | 0.850 | 0.80 |
-| **code** | 0.414 | 0.646 | **0.677** | 0.768 | 0.50 |
+| **docs** | 0.590 | 0.770 | **0.830** | 0.880 | 0.80 |
+| **code** | 0.434 | 0.626 | **0.707** | 0.798 | 0.50 |
 
 | Operation | Measured | Limit |
 |---|---|---|
-| Indexing 1 971 files → 18 792 chunks | 4.5 s | 300 s |
+| Indexing 1 971 files → 14 692 chunks | ~8 s | 300 s |
 | Searching 100 questions | ~6 s | 90 s / 200 questions |
 | Generating one answer | 37.3 s | none stated |
 
@@ -145,7 +154,9 @@ context, takes 7 s instead of 37 s, which confirms where the time goes.
 
 ### What moved recall
 
-Two structural changes account for nearly all of it.
+These ablations were run while developing the retriever, on the earlier
+hand-rolled chunker; the conclusions carried into the current splitter-based
+one. Two structural changes accounted for most of the recall.
 
 **Tokenisation**, which improved code recall fourfold:
 
@@ -166,19 +177,9 @@ that were never indexed, capping docs recall at 0.970 regardless of ranking:
 ### What did not
 
 **Chunk size.** Sweeping `--max_chunk_size` from 400 to 2000 showed no clear
-trend. Imposing a minimum chunk size was also measured:
-
-| minimum size | docs@5 | code@5 |
-|---|---|---|
-| **none (current)** | **0.820** | **0.677** |
-| 100 | 0.820 | 0.677 |
-| 200 | 0.830 | 0.616 |
-| 600 | 0.770 | 0.636 |
-
-So: *too small* has no measurable effect below a couple of hundred characters —
-a chunk holding nothing but a heading never wins a ranking and never disturbs
-one. Merging harder does hurt, losing semantic boundaries. *Too large*, and the
-2000-character hard limit bites first.
+trend, so the default stays at 2000. The current splitter adds a 200-character
+overlap, so a passage that falls on a chunk boundary still lands whole in a
+neighbour.
 
 **BM25 parameters.** Sweeping `k1` and `b` moved results by at most 0.05,
 indistinguishable from noise on 100 questions. One combination landed docs@5 at
@@ -195,8 +196,12 @@ characters.
 **One tokeniser, one module.** Indexing and querying must agree exactly;
 sharing a function makes divergence impossible rather than merely unlikely.
 
-**Positions derived from the source, never accumulated.** Indices and content
-cannot disagree when one is sliced from the other.
+**A standard splitter over a hand-rolled one.** `RecursiveCharacterTextSplitter`
+replaced ~140 lines of custom `class`/`def` and heading splitting with the same
+two strategies (`Language.PYTHON`, `Language.MARKDOWN`) plus overlap. It stays
+safe only because `add_start_index` records each chunk's position and
+`strip_whitespace=False` keeps the content a verbatim slice, so indices and
+content cannot disagree.
 
 **`k` and the generation budget are separate.** Retrieval returns `k` sources —
 10 by default, which is what gets scored — but only the first five reach the
@@ -235,8 +240,9 @@ This is invisible in normal use — the retrieved text still looks right — but
 the grader counts a source as found only if its character range overlaps the
 reference. Perfect retrieval with drifted offsets scores zero.
 
-The fix was to stop deriving positions from lengths. After the rewrite:
-**18 792 chunks, 100% exact, none over 2000 characters.**
+The fix was to never reconstruct text. The splitter records positions with
+`add_start_index` and keeps content verbatim (`strip_whitespace=False`):
+**14 692 chunks, 100% exact, none over 2000 characters.**
 
 ### Code that does not read like prose
 
@@ -289,7 +295,7 @@ uv run python -m src answer_dataset \
 uv run python -m src evaluate \
   --student_search_results_path data/output/search_results/UnansweredQuestions/dataset_docs_public.json \
   --dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json
-# Recall@1: 0.610  Recall@3: 0.750  Recall@5: 0.820  Recall@10: 0.850
+# Recall@1: 0.590  Recall@3: 0.770  Recall@5: 0.830  Recall@10: 0.880
 ```
 
 Degenerate inputs exit with a message rather than a traceback:
@@ -314,6 +320,8 @@ uv run python -m src search_dataset --dataset_path /nonexistent.json --save_dire
 - [Qwen3 model card](https://huggingface.co/Qwen/Qwen3-0.6B) and
   [transformers](https://huggingface.co/docs/transformers/) — chat template and
   generation
+- [LangChain text splitters](https://python.langchain.com/docs/how_to/recursive_text_splitter/)
+  — `RecursiveCharacterTextSplitter`, used for chunking
 - [pydantic](https://docs.pydantic.dev/),
   [Python Fire](https://github.com/google/python-fire)
 

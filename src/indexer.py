@@ -1,167 +1,62 @@
 from typing import List
 from pathlib import Path
-import re
 from rank_bm25 import BM25Okapi
 import json
 import pickle
 from tqdm import tqdm
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from .tokenizer import tokenize
 
 
 class CodeIndexer:
     """Splits corpus files into chunks and builds a BM25 index.
 
-    Boundaries are character positions found in the original text, and
-    content is always a slice of it, so indices and content cannot drift
-    apart.
+    Two chunking strategies, one per file kind, both built on
+    RecursiveCharacterTextSplitter: code is cut on class/def boundaries,
+    prose on headings, each falling back to blank lines, spaces and finally
+    single characters so no chunk exceeds the size limit. Every chunk records
+    the character range it was sliced from (add_start_index), and whitespace
+    is never stripped, so indices and content cannot drift apart.
     """
 
-    def chunk_python_file(
-            self, content: str,
-            max_chunk_size: int, path_file: str) -> List[dict]:
-        """Chunk a Python file on class/def boundaries, then by paragraphs.
+    def _chunk_file(
+            self, path_file: str, max_chunk_size: int,
+            language: Language) -> List[dict]:
+        """Chunk one file with a language-aware recursive splitter.
 
         Args:
-            content: Path to the file to read.
+            path_file: Path to read and to record in each chunk; compared
+                literally by the grader.
             max_chunk_size: Upper bound on chunk length, in characters.
-            path_file: Path to record in each chunk; compared literally by
-                the grader.
+            language: Separator set to use (PYTHON for code, MARKDOWN for
+                prose).
 
         Returns:
             The chunk records for this file.
         """
-        chunks_py: List[dict] = []
 
-        with open(content, 'r') as f:
+        with open(path_file, 'r') as f:
             file_content = f.read()
 
-        starts = []
-        for m in re.finditer(r'^(class |def )', file_content,
-                             flags=re.MULTILINE):
-            starts.append(m.start())
-
-        if not starts or starts[0] != 0:
-            starts.insert(0, 0)
-        starts.append(len(file_content))
-
-        for i in range(len(starts) - 1):
-            self._split_range(file_content, starts[i], starts[i + 1],
-                              max_chunk_size, path_file, chunks_py)
-
-        return chunks_py
-
-    def _split_range(
-            self, text: str, start: int, end: int, max_chunk_size: int,
-            path_file: str, chunks_list: List[dict]) -> None:
-        """Emit chunks covering text[start:end], cutting on blank lines.
-
-        Accumulates up to the last cut position that still fits, then emits
-        there.
-
-        Args:
-            text: The whole file content.
-            start: Absolute start of the range to cover.
-            end: Absolute end of the range to cover.
-            max_chunk_size: Upper bound on chunk length.
-            path_file: Path to record in each chunk.
-            chunks_list: Accumulator the chunks are appended to.
-        """
-
-        if (end - start) <= max_chunk_size:
-            self._add_chunk(
-                text, start, end, max_chunk_size, path_file, chunks_list
-            )
-            return
-
-        positions = []
-        for sep in re.finditer(r'\n\n+', text[start:end]):
-            positions.append(start + sep.end())
-        positions.append(end)
-
-        prev = start
-        for pos in positions:
-            if (pos - start) > max_chunk_size and prev > start:
-                self._add_chunk(text, start, prev, max_chunk_size,
-                                path_file, chunks_list)
-                start = prev
-            prev = pos
-
-        self._add_chunk(
-            text, start, end, max_chunk_size, path_file, chunks_list
+        splitter = RecursiveCharacterTextSplitter.from_language(
+            language=language,
+            chunk_size=max_chunk_size,
+            chunk_overlap=200,
+            add_start_index=True,
+            strip_whitespace=False,
         )
 
-    def _add_chunk(
-            self, text: str, start: int, end: int, max_chunk_size: int,
-            path_file: str, chunks_list: List[dict]) -> None:
-        """Store text[start:end], slicing anything still over the limit.
+        chunks: List[dict] = []
+        for doc in splitter.create_documents([file_content]):
+            start = doc.metadata['start_index']
+            chunks.append({
+                "file_path": path_file,
+                "first_character_index": start,
+                "last_character_index": start + len(doc.page_content),
+                "content": doc.page_content,
+            })
 
-        The only place that writes a chunk, and so the only place the size
-        limit has to be enforced.
-
-        Args:
-            text: The whole file content.
-            start: Absolute start of the range to store.
-            end: Absolute end of the range to store.
-            max_chunk_size: Upper bound on chunk length.
-            path_file: Path to record in each chunk.
-            chunks_list: Accumulator the chunks are appended to.
-        """
-
-        while start < end:
-            stop = start + max_chunk_size
-            if stop < end:
-                chunk = text[start: stop]
-                chunk_dict = {
-                    "file_path": path_file,
-                    "first_character_index": start,
-                    "last_character_index": stop,
-                    "content": chunk
-                }
-                chunks_list.append(chunk_dict)
-                start = stop
-            else:
-                chunk = text[start: end]
-                chunk_dict = {
-                    "file_path": path_file,
-                    "first_character_index": start,
-                    "last_character_index": end,
-                    "content": chunk
-                }
-                chunks_list.append(chunk_dict)
-                start = end
-
-    def chunk_markdown_file(
-            self, content: str,
-            max_chunk_size: int, path_file: str) -> List[dict]:
-        """Chunk a markdown file by headings, then by paragraphs if needed.
-
-        Args:
-            content: Path to the file to read.
-            max_chunk_size: Upper bound on chunk length, in characters.
-            path_file: Path to record in each chunk; compared literally by
-                the grader.
-
-        Returns:
-            The chunk records for this file.
-        """
-        chunks_md: List[dict] = []
-
-        with open(content, 'r') as f:
-            file_content = f.read()
-
-        starts = []
-        for m in re.finditer(r'^#{1,6} .*$', file_content, flags=re.MULTILINE):
-            starts.append(m.start())
-
-        if not starts or starts[0] != 0:
-            starts.insert(0, 0)
-        starts.append(len(file_content))
-
-        for i in range(len(starts) - 1):
-            self._split_range(file_content, starts[i], starts[i + 1],
-                              max_chunk_size, path_file, chunks_md)
-
-        return chunks_md
+        return chunks
 
     def index_corpus(self, max_chunk_size: int) -> List[dict]:
         """Ingest data/raw/ and write the index under data/processed/.
@@ -186,13 +81,13 @@ class CodeIndexer:
         for file in tqdm(files, desc='Indexing'):
             file_str = str(file)
             try:
-                if file_str.endswith('.md'):
-                    chunks = self.chunk_markdown_file(
-                        file_str, max_chunk_size, file_str
+                if file_str.endswith('.py'):
+                    chunks = self._chunk_file(
+                        file_str, max_chunk_size, Language.PYTHON
                     )
                 else:
-                    chunks = self.chunk_python_file(
-                        file_str, max_chunk_size, file_str
+                    chunks = self._chunk_file(
+                        file_str, max_chunk_size, Language.MARKDOWN
                     )
                 all_chunks.extend(chunks)
             except (UnicodeDecodeError, OSError) as e:
@@ -221,16 +116,19 @@ class CodeIndexer:
         return all_chunks
 
     def _tokenize(self, content: List[dict]) -> List[List[str]]:
-        """Turn chunk records into the token lists BM25 learns from."""
+        """Turn chunk records into the token lists BM25 learns from.
 
-        chunks_content: List[str] = []
+        The file name is prepended to the content before tokenising, so a
+        query term that names the file (e.g. 'lora' in lora.md) can lift the
+        chunk in the ranking. Only the name is used: the directory tokens
+        added noise and cost recall. The stored content is untouched, so the
+        character indices stay exact.
+        """
+
         chunks_tokenizer: List[List[str]] = []
 
         for c in content:
-            chunks_content.append(c['content'])
-
-        for words in chunks_content:
-            tokens = tokenize(words)
-            chunks_tokenizer.append(tokens)
+            name = Path(c['file_path']).name
+            chunks_tokenizer.append(tokenize(name + '\n' + c['content']))
 
         return chunks_tokenizer
